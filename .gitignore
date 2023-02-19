@@ -2,10 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.idea
+data
+.DS_Store
 # C extensions
 *.so
-
+checkpoint
+logs
+db
+.ipynb_checkpoints
 # Distribution / packaging
 .Python
 build/
