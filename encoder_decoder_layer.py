@@ -5,16 +5,8 @@
 @author: jkguo
 @create: 2023/2/13
 """
-import math
-import datetime
-import sys
-import typing
-
 import tensorflow as tf
-import numpy as np
-from vocab import Vocab, END_SENTENCE, BEGIN_SENTENCE
-from data_generator import TranslateDataGenerator
-import progressbar
+from attention import AdditiveAttentionLayer
 
 
 class EncoderLayer(tf.keras.layers.Layer):
@@ -65,7 +57,7 @@ class DecoderLayer(tf.keras.layers.Layer):
     def __init__(self, dec_vocab_size: int, embedding_size: int, gru_layers: int, hidden_unit: int, dropout=0.0,
                  **kwargs):
         super(DecoderLayer, self).__init__(**kwargs)
-        dropout = kwargs.get("dropout", 0.0)
+        self.dropout = dropout
         self.dec_vocab_size: int = dec_vocab_size
         self.embedding_size: int = embedding_size
         self.gru_layers: int = gru_layers
@@ -78,12 +70,18 @@ class DecoderLayer(tf.keras.layers.Layer):
             )
         self.embedding = tf.keras.layers.Embedding(dec_vocab_size, embedding_size)
         self.dense = tf.keras.layers.Dense(dec_vocab_size, activation="softmax")
+        self.has_attention_weights = False
 
-    @staticmethod
-    def init_state(enc_all_outputs, *args):
+    def init_state(self, enc_all_outputs, enc_valid_len, *args):
+        # 将encoder 最后的一层的最后state作为context
         state = enc_all_outputs[1][-1]
         context = tf.reshape(state, shape=(-1, 1, state.shape[1]))
         return enc_all_outputs[1], context
+
+    def calc_context_state(self, inputs, states, context, training):
+        time_steps = inputs.shape[1]
+        context_state = tf.repeat(context, repeats=time_steps, axis=1)
+        return context_state
 
     def call(self, inputs, *args, **kwargs):
         """
@@ -96,10 +94,9 @@ class DecoderLayer(tf.keras.layers.Layer):
         context = kwargs['context']
         training = kwargs["training"]
         inputs = self.embedding(inputs)
-        time_steps = inputs.shape[1]
-        context = tf.repeat(context, repeats=time_steps, axis=1)
+        context_state = self.calc_context_state(inputs, states, context, training)
         decode_inputs_with_ctx = tf.concat([
-            inputs, context
+            inputs, context_state
         ], axis=2)
         x = decode_inputs_with_ctx
         new_states = []
@@ -119,198 +116,68 @@ class DecoderLayer(tf.keras.layers.Layer):
         return config
 
 
-def sequence_mask(x, valid_len, value=0):
-    """在序列中屏蔽不相关的项"""
-    max_len = x.shape[1]
-    mask = tf.range(start=0, limit=max_len, dtype=tf.float32)[
-           None, :] < tf.cast(valid_len[:, None], dtype=tf.float32)
+class AttentionDecoderLayer(DecoderLayer):
 
-    if len(x.shape) == 3:
-        return tf.where(tf.expand_dims(mask, axis=-1), x, value)
-    else:
-        return tf.where(mask, x, value)
+    def __init__(self, **kwargs):
+        super(AttentionDecoderLayer, self).__init__(**kwargs)
+        self.attention_layer = AdditiveAttentionLayer(self.hidden_unit, self.dropout)
+        self._attention_weights = []
+        self.has_attention_weights = True
 
+    def init_state(self, enc_all_outputs, enc_valid_len, *args):
+        enc_outputs, enc_states = enc_all_outputs
+        context = (enc_outputs, enc_valid_len)
+        return enc_states, context
 
-class MaskedSparseCategoricalCrossEntropy(tf.keras.losses.Loss):
+    def calc_context_state(self, inputs, states, context, training):
+        enc_outputs, enc_valid_len = context
+        # 用当前最后一层的state作为查询条件，转shape batch_size, 1, hidden_unit
+        # 查询个数固定为1
+        queries = tf.expand_dims(states[-1], axis=1)
+        # enc_outputs的形状为(batch_size,num_steps,num_hidden)
+        # 用编码器的输出作为key和value， k-v count： num_steps, 特征数为 num_hidden
+        keys = values = enc_outputs
+        # 计算出来的attention shape： batch_size, query_count, value_features
+        attention = self.attention_layer(queries, keys, values, enc_valid_len, training=training)
+        return attention
 
-    def __init__(self, valid_len: int):
-        super().__init__(reduction='none')
-        self.valid_len = valid_len
-
-    def call(self, y_true, y_pred):
+    def call(self, inputs, *args, **kwargs):
         """
-
-        :param y_true: shape [batch_size, time_steps]
-        :param y_pred: shape [batch_size, time_steps, feature_count]
+        :param inputs: shape [batch_size, time_steps]
+        :param args:
+        :param kwargs:
         :return:
         """
-        weights = tf.ones_like(y_true, dtype=tf.float32)
-        weights = sequence_mask(weights, self.valid_len)
-        label_one_hot = tf.one_hot(y_true, depth=y_pred.shape[-1])
-        unweighted_loss = tf.keras.losses.CategoricalCrossentropy(reduction='none')(label_one_hot, y_pred)
-        # Loss function should always return a vector of length batch_size. Because you have to return a loss for
-        # each datapoint. Ex - If you are fitting data with a batch size of 32, then you need to return a vector of
-        # length 32 from your loss function.
-        weighted_loss = tf.reduce_mean((unweighted_loss * weights), axis=1)
-        return weighted_loss
-
-
-def grad_clipping(grads, theta):  # @save
-    """Clip the gradient."""
-    theta = tf.constant(theta, dtype=tf.float32)
-    new_grad = []
-    for grad in grads:
-        if isinstance(grad, tf.IndexedSlices):
-            new_grad.append(tf.convert_to_tensor(grad))
-        else:
-            new_grad.append(grad)
-    norm = tf.math.sqrt(sum((tf.reduce_sum(grad ** 2)).numpy()
-                            for grad in new_grad))
-    norm = tf.cast(norm, tf.float32)
-    if tf.greater(norm, theta):
-        for i, grad in enumerate(new_grad):
-            new_grad[i] = grad * theta / norm
-    else:
-        new_grad = new_grad
-    return new_grad
-
-
-class TranslateModel(tf.keras.Model):
-
-    def __init__(self, enc_vocab_size: int, enc_embedding_size, dec_vocab_size, dec_embedding_size, gru_layers: int = 3,
-                 gru_hidden_units: int = 32, name="translate_model", **kwargs):
-        super(TranslateModel, self).__init__(name=name, **kwargs)
-        self.encoder = EncoderLayer(enc_vocab_size=enc_vocab_size,
-                                    embedding_size=enc_embedding_size, dropout=0.0,
-                                    gru_layers=gru_layers, hidden_unit=gru_hidden_units, name="gru_encoder")
-        self.decoder = DecoderLayer(dec_vocab_size=dec_vocab_size,
-                                    embedding_size=dec_embedding_size, dropout=0.0,
-                                    gru_layers=gru_layers, hidden_unit=gru_hidden_units, name="gru_decoder")
-
-    def call(self, inputs, training=None, mask=None):
-        enc_x, dec_x = inputs
-        enc_all_outputs = self.encoder(enc_x, training=training)
-        enc_states, context = self.decoder.init_state(enc_all_outputs)
-        dec_outputs, dec_states = self.decoder(dec_x, states=enc_states, context=context, training=training)
-        return dec_outputs
-
-    def __generate_tensor_graph(self, data_gen: TranslateDataGenerator,
-                                train_summary_writer, train_log_dir, optimizer):
-        tf.summary.trace_on(graph=True, profiler=False)
-        self.__train_step(data_gen, 0, 32, optimizer)
-        with train_summary_writer.as_default():
-            tf.summary.trace_export(
-                name="graph",  # <- Name of tag
-                step=0,
-                profiler_outdir=train_log_dir)
-
-    def __train_step(self, data_gen, start, end, optimizer):
-        sub_enc_x, _, sub_dec_x, sub_target_valid_len, sub_target_y = data_gen[start: end]
-        with tf.GradientTape() as tape:
-            y_pred = self.call((sub_enc_x, sub_dec_x), training=True)
-            loss_fn = MaskedSparseCategoricalCrossEntropy(sub_target_valid_len)
-            loss = loss_fn(sub_target_y, y_pred)
-        gradients = tape.gradient(loss, self.trainable_variables)
-        gradients = grad_clipping(gradients, 1)
-        optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        return loss
-
-    def custom_fit(
-            self,
-            data_gen: TranslateDataGenerator,
-            batch_size=32,
-            epochs=1,
-            learning_rate=1e-3
-    ):
-        x_len = len(data_gen)
-        step_count = math.ceil(len(data_gen) / batch_size)
-        optimizer = tf.keras.optimizers.legacy.Adam(learning_rate)
-
-        train_loss_metric = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-        current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        train_log_dir = 'logs/' + current_time + '/train'
-        train_summary_writer = tf.summary.create_file_writer(train_log_dir)
-
-        self.__generate_tensor_graph(data_gen, train_summary_writer, train_log_dir, optimizer)
-        for epoch in range(epochs):
-            si_list = np.arange(step_count)
-            np.random.shuffle(si_list)
-            print(f"Epoch {epoch + 1}/{epochs}")
-            bar = progressbar.ProgressBar(maxval=step_count,
-                                          widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()],
-                                          fd=sys.stdout)
-            bar.start()
-            for step, si in enumerate(si_list):
-                start = si * batch_size
-                end = min(start + batch_size, x_len)
-                loss = self.__train_step(data_gen, start, end, optimizer)
-                train_loss_metric(loss)
-                bar.update(step)
-            bar.finish()
-            with train_summary_writer.as_default():
-                tf.summary.scalar('loss', train_loss_metric.result(), step=epoch)
-            template = 'Epoch {}, Loss: {:.4f}'
-            print(template.format(epoch + 1,
-                                  train_loss_metric.result()))
-            train_loss_metric.reset_states()
-
-    def translate(
-            self,
-            inputs,
-            dec_vocab: Vocab,
-            max_len: int = 50
-    ):
-        enc_all_outputs = self.encoder(inputs, training=False)
-        enc_states, context = self.decoder.init_state(enc_all_outputs)
-        dec_x = np.array([
-            dec_vocab[BEGIN_SENTENCE]
-        ]).reshape((1, 1))
+        states = kwargs["states"]
+        context = kwargs['context']
+        training = kwargs["training"]
+        inputs = self.embedding(inputs)  # shape: batch_size, time_steps, embedding_size
+        inputs = tf.transpose(inputs, perm=(1, 0, 2))  # shape: time_steps, batch_size, embedding_size
         outputs = []
-        dec_states = enc_states
-        for i in range(max_len):
-            dec_outputs, dec_states = self.decoder(dec_x, states=dec_states, context=context, training=False)
-            dec_outputs = tf.argmax(dec_outputs, axis=2)
-            pred = dec_outputs[0][0]
-            pred = dec_vocab.to_tokens(pred)
-            if pred == END_SENTENCE:
-                break
-            outputs.append(pred)
-            dec_x = dec_outputs
-        if dec_vocab.token_mode == "word":
-            return ' '.join(outputs)
-        else:
-            return ''.join(outputs)
+        self._attention_weights = []
+        # 针对每个time_step进行计算
+        for x in inputs:
+            # x shape: batch_size, embedding_size
+            # context_state: batch_size, 1, num_hidden
+            context_state = self.calc_context_state(inputs, states, context, training)
+            self._attention_weights.append(self.attention_layer.attention_weights)
+            # 在特征维度上连结 decode_inputs_with_ctx
+            decode_inputs_with_ctx = tf.concat([
+                context_state,
+                tf.expand_dims(x, axis=1)
+            ], axis=-1)
+            # shape: batch_size, time_step=1, num_hidden + embedding_size
+            gx = decode_inputs_with_ctx
+            new_states = []
+            for i, gru in enumerate(self.gru_list):
+                gx, state = gru(gx, initial_state=states[i], training=training)
+                new_states.append(state)
+            states = new_states
+            outputs.append(gx)
+        # outputs shape: batch_size, time_steps, num_hidden
+        outputs = tf.concat(outputs, axis=1)
+        return self.dense(outputs), states
 
-
-def bleu_acc(y_true: typing.List[str], y_pred: typing.List[str], k: int):
-    """
-    用BLEU算法评测预测序列的准确性
-    :param y_true:
-    :param y_pred:
-    :param k:
-    :return:
-    """
-    score = math.exp(
-        min(0.0, 1.0 - len(y_true) * 1.0 / len(y_pred))
-    )
-    for n in range(1, min(len(y_pred), k + 1)):
-        mp = {}
-        for s in range(len(y_true) - n + 1):
-            key = '<--->'.join(y_true[s: s + n])
-            if key in mp:
-                mp[key] += 1
-            else:
-                mp[key] = 1
-        all_count = 0
-        match_count = 0
-        for s in range(len(y_pred) - n + 1):
-            key = '<--->'.join(y_pred[s: s + n])
-            all_count += 1
-            if mp.get(key, 0) > 0:
-                match_count += 1
-                mp[key] -= 1
-        score *= math.pow(
-            match_count * 1.0 / all_count,
-            math.pow(0.5, n)
-        )
-    return score
+    @property
+    def attention_weights(self):
+        return self._attention_weights

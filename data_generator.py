@@ -67,9 +67,11 @@ class TranslateDataGenerator(tf.keras.utils.Sequence):
         print("source: ")
         print(f"  vocab size: {len(self.x_vocab)}")
         print(f"  enc_x avg len: {np.average(self.enc_valid_len)}")
+        print(f"  enc_x max len: {np.max(self.enc_valid_len)}")
         print("targe: ")
         print(f"  vocab size: {len(self.y_vocab)}")
         print(f"  dec_x avg len: {np.average(self.dec_valid_len)}")
+        print(f"  dec_x max len: {np.max(self.dec_valid_len)}")
 
     @staticmethod
     def __str_to_vec(lines: typing.List[str], max_len: int, vocab: Vocab):
