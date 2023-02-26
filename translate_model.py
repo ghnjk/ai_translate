@@ -14,7 +14,8 @@ import tensorflow as tf
 import progressbar
 from vocab import Vocab, BEGIN_SENTENCE, END_SENTENCE
 from data_generator import TranslateDataGenerator
-from encoder_decoder_layer import EncoderLayer, DecoderLayer, AttentionDecoderLayer
+from encoder_decoder_layer import EncoderLayer, DecoderLayer, AttentionDecoderLayer, TransformerEncoderLayer, \
+    TransformerDecoderLayer
 
 
 def sequence_mask(x, valid_len, value=0):
@@ -126,7 +127,7 @@ class TranslateModelBase(tf.keras.Model):
 
     def call(self, inputs, training=None, mask=None):
         enc_x, enc_valid_len, dec_x = inputs
-        enc_all_outputs = self.encoder(enc_x, training=training)
+        enc_all_outputs = self.encoder(enc_x, enc_valid_len, training=training)
         enc_states, context = self.decoder.init_state(enc_all_outputs, enc_valid_len)
         dec_outputs, dec_states = self.decoder(dec_x, states=enc_states, context=context, training=training)
         return dec_outputs
@@ -198,7 +199,7 @@ class TranslateModelBase(tf.keras.Model):
             dec_vocab: Vocab,
             max_len: int = 50
     ):
-        enc_all_outputs = self.encoder(enc_x, training=False)
+        enc_all_outputs = self.encoder(enc_x, enc_valid_len, training=False)
         enc_states, context = self.decoder.init_state(enc_all_outputs, enc_valid_len)
         dec_x = np.array([
             dec_vocab[BEGIN_SENTENCE]
@@ -272,3 +273,38 @@ class AttentionSeq2SeqTranslateModel(TranslateModelBase):
                                      embedding_size=self.dec_embedding_size, dropout=self.dropout,
                                      gru_layers=self.gru_layers, hidden_unit=self.gru_hidden_units,
                                      name="attention_gru_decoder")
+
+
+class TransformerSeq2SeqTranslateModel(TranslateModelBase):
+
+    def __init__(self, enc_vocab_size: int, enc_embedding_size, dec_vocab_size, dec_embedding_size,
+                 dropout=0.1, num_blocks: int = 2, hidden_units: int = 32, ffn_num_hidden: int = 64,
+                 num_head: int = 4,
+                 name="translate_model", **kwargs):
+        self.enc_vocab_size: int = enc_vocab_size
+        self.dec_vocab_size: int = dec_vocab_size
+        self.num_blocks: int = num_blocks
+        self.dropout = dropout
+        self.hidden_units: int = hidden_units
+        self.ffn_num_hidden: int = ffn_num_hidden
+        self.num_head: int = num_head
+        self.dec_embedding_size: int = dec_embedding_size
+        self.enc_embedding_size: int = enc_embedding_size
+        super(TransformerSeq2SeqTranslateModel, self).__init__(name=name, **kwargs)
+
+    def build_encoder_layer(self) -> EncoderLayer:
+        return TransformerEncoderLayer(enc_vocab_size=self.enc_vocab_size,
+                                       embedding_size=self.enc_embedding_size,
+                                       num_blocks=self.num_blocks,
+                                       dropout=self.dropout,
+                                       hidden_unit=self.hidden_units,
+                                       ffn_num_hidden=self.ffn_num_hidden,
+                                       num_head=self.num_head)
+
+    def build_decoder_layer(self) -> DecoderLayer:
+        return TransformerDecoderLayer(dec_vocab_size=self.dec_vocab_size,
+                                       embedding_size=self.dec_embedding_size, dropout=self.dropout,
+                                       num_blocks=self.num_blocks,
+                                       hidden_unit=self.hidden_units,
+                                       ffn_num_hidden=self.ffn_num_hidden,
+                                       num_head=self.num_head)
